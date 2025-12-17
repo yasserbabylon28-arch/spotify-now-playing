@@ -1,11 +1,9 @@
-from flask import Flask, Response, request, redirect
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 import requests
 import base64
 import os
-from io import BytesIO
-from PIL import Image, ImageDraw, ImageFont
-
-app = Flask(__name__)
+import json
 
 SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID')
 SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
@@ -13,98 +11,91 @@ SPOTIFY_REFRESH_TOKEN = os.getenv('SPOTIFY_REFRESH_TOKEN')
 
 def get_access_token():
     auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
-    auth_bytes = auth_str.encode('utf-8')
-    auth_base64 = base64.b64encode(auth_bytes).decode('utf-8')
-    
-    url = "https://accounts.spotify.com/api/token"
-    headers = {
-        "Authorization": f"Basic {auth_base64}",
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": SPOTIFY_REFRESH_TOKEN
-    }
-    
-    response = requests.post(url, headers=headers, data=data)
-    return response.json().get('access_token')
-
-def get_now_playing():
-    token = get_access_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get("https://api.spotify.com/v1/me/player/currently-playing", headers=headers)
-    
-    if response.status_code == 204 or not response.json():
-        return None
-    
-    data = response.json()
-    return {
-        'song': data['item']['name'],
-        'artist': data['item']['artists'][0]['name'],
-        'album_art': data['item']['album']['images'][0]['url'],
-        'is_playing': data['is_playing']
-    }
-
-@app.route('/api')
-def api():
-    data = get_now_playing()
-    if not data:
-        return Response("Not playing", status=200)
-    
-    # Create image
-    img = Image.new('RGB', (600, 200), color='#1a1a1a')
-    draw = ImageDraw.Draw(img)
-    
-    # Download album art
-    album_response = requests.get(data['album_art'])
-    album_img = Image.open(BytesIO(album_response.content))
-    album_img = album_img.resize((150, 150))
-    img.paste(album_img, (25, 25))
-    
-    # Draw text
-    try:
-        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
-    except:
-        font_large = ImageFont.load_default()
-        font_small = ImageFont.load_default()
-    
-    draw.text((200, 50), data['song'][:30], fill='#ffffff', font=font_large)
-    draw.text((200, 90), data['artist'][:30], fill='#b3b3b3', font=font_small)
-    draw.text((200, 130), "🎵 Now Playing" if data['is_playing'] else "⏸️ Paused", fill='#1DB954', font=font_small)
-    
-    # Save to bytes
-    buf = BytesIO()
-    img.save(buf, format='PNG')
-    buf.seek(0)
-    
-    return Response(buf.getvalue(), mimetype='image/png')
-
-@app.route('/api/login')
-def login():
-    scope = "user-read-currently-playing"
-    redirect_uri = request.url_root + 'api/callback'
-    
-    auth_url = f"https://accounts.spotify.com/authorize?client_id={SPOTIFY_CLIENT_ID}&response_type=code&redirect_uri={redirect_uri}&scope={scope}"
-    return redirect(auth_url)
-
-@app.route('/api/callback')
-def callback():
-    code = request.args.get('code')
-    redirect_uri = request.url_root + 'api/callback'
-    
-    auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
     auth_base64 = base64.b64encode(auth_str.encode()).decode()
     
     response = requests.post(
         "https://accounts.spotify.com/api/token",
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri
-        },
-        headers={"Authorization": f"Basic {auth_base64}"}
+        headers={"Authorization": f"Basic {auth_base64}"},
+        data={"grant_type": "refresh_token", "refresh_token": SPOTIFY_REFRESH_TOKEN}
     )
-    
-    refresh_token = response.json().get('refresh_token')
-    return f"<h1>Your Refresh Token:</h1><p>{refresh_token}</p><p>Add this to your Vercel Environment Variables as SPOTIFY_REFRESH_TOKEN</p>"
+    return response.json().get('access_token')
+
+def get_now_playing():
+    if not SPOTIFY_REFRESH_TOKEN:
+        return None
+    token = get_access_token()
+    response = requests.get(
+        "https://api.spotify.com/v1/me/player/currently-playing",
+        headers={"Authorization": f"Bearer {token}"}
+    )
+    if response.status_code != 200:
+        return None
+    return response.json()
+
+class handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = urlparse(self.path).path
+        query = parse_qs(urlparse(self.path).query)
+        
+        if path == '/api':
+            data = get_now_playing()
+            if not data:
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Not playing')
+                return
+            
+            song = data['item']['name']
+            artist = data['item']['artists'][0]['name']
+            
+            svg = f'''
+            <svg width="600" height="200" xmlns="http://www.w3.org/2000/svg">
+                <rect width="600" height="200" fill="#1a1a1a" rx="10"/>
+                <text x="30" y="80" font-size="24" fill="#ffffff" font-family="Arial">{song[:30]}</text>
+                <text x="30" y="120" font-size="18" fill="#b3b3b3" font-family="Arial">{artist[:30]}</text>
+                <text x="30" y="160" font-size="16" fill="#1DB954" font-family="Arial">🎵 Now Playing</text>
+            </svg>
+            '''
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'image/svg+xml')
+            self.end_headers()
+            self.wfile.write(svg.encode())
+            
+        elif path == '/api/login':
+            redirect_uri = f"https://{self.headers['Host']}/api/callback"
+            auth_url = f"https://accounts.spotify.com/authorize?client_id={SPOTIFY_CLIENT_ID}&response_type=code&redirect_uri={redirect_uri}&scope=user-read-currently-playing"
+            
+            self.send_response(302)
+            self.send_header('Location', auth_url)
+            self.end_headers()
+            
+        elif path == '/api/callback':
+            code = query.get('code', [None])[0]
+            redirect_uri = f"https://{self.headers['Host']}/api/callback"
+            
+            auth_base64 = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+            response = requests.post(
+                "https://accounts.spotify.com/api/token",
+                data={"grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri},
+                headers={"Authorization": f"Basic {auth_base64}"}
+            )
+            
+            refresh_token = response.json().get('refresh_token')
+            
+            html = f'''
+            <html>
+            <body style="background: #000; color: #0f0; font-family: monospace; padding: 50px;">
+                <h1>✅ SUCCESS!</h1>
+                <h2>Your Refresh Token:</h2>
+                <p style="background: #111; padding: 20px; word-break: break-all; border: 2px solid #0f0;">{refresh_token}</p>
+                <p>Add this to Vercel Environment Variables as: <strong>SPOTIFY_REFRESH_TOKEN</strong></p>
+            </body>
+            </html>
+            '''
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(html.encode())
